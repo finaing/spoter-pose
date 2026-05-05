@@ -35,7 +35,7 @@ def train_epoch(model, dataloader, criterion, optimizer, device, scheduler=None)
 def evaluate(model, dataloader, device, print_stats=False):
 
     pred_correct, pred_all = 0, 0
-    stats = {i: [0, 0] for i in range(101)}
+    stats = {}
 
     for i, data in enumerate(dataloader):
         inputs, labels = data
@@ -45,11 +45,13 @@ def evaluate(model, dataloader, device, print_stats=False):
         outputs = model(inputs).expand(1, -1, -1)
 
         # Statistics
-        if int(torch.argmax(torch.nn.functional.softmax(outputs, dim=2))) == int(labels[0][0]):
-            stats[int(labels[0][0])][0] += 1
+        label = int(labels[0][0])
+        stats.setdefault(label, [0, 0])
+        if int(torch.argmax(torch.nn.functional.softmax(outputs, dim=2))) == label:
+            stats[label][0] += 1
             pred_correct += 1
 
-        stats[int(labels[0][0])][1] += 1
+        stats[label][1] += 1
         pred_all += 1
 
     if print_stats:
@@ -73,7 +75,8 @@ def evaluate_top_k(model, dataloader, device, k=5):
 
         outputs = model(inputs).expand(1, -1, -1)
 
-        if int(labels[0][0]) in torch.topk(outputs, k).indices.tolist():
+        probs = torch.nn.functional.softmax(outputs, dim=2)[0, 0]
+        if int(labels[0][0]) in torch.topk(probs, k).indices.tolist():
             pred_correct += 1
 
         pred_all += 1

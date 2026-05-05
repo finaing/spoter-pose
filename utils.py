@@ -8,11 +8,19 @@ from sklearn.model_selection import train_test_split
 
 def __balance_val_split(dataset, val_split=0.):
     targets = np.array(dataset.targets)
-    train_indices, val_indices = train_test_split(
-        np.arange(targets.shape[0]),
-        test_size=val_split,
-        stratify=targets
-    )
+    try:
+        train_indices, val_indices = train_test_split(
+            np.arange(targets.shape[0]),
+            test_size=val_split,
+            stratify=targets
+        )
+    except ValueError:
+        # Stratified split requires at least 2 samples per class.
+        # Fall back to a random split when some classes have only 1 sample.
+        train_indices, val_indices = train_test_split(
+            np.arange(targets.shape[0]),
+            test_size=val_split,
+        )
 
     train_dataset = Subset(dataset, indices=train_indices)
     val_dataset = Subset(dataset, indices=val_indices)

@@ -14,6 +14,35 @@ HAND_IDENTIFIERS = [id + "_0" for id in HAND_IDENTIFIERS] + [id + "_1" for id in
 ARM_IDENTIFIERS_ORDER = ["neck", "$side$Shoulder", "$side$Elbow", "$side$Wrist"]
 
 
+def augment_frame_dropout(sign: dict, dropout_min: float = 0.0, dropout_max: float = 0.3) -> dict:
+    """
+    AUGMENTATION TECHNIQUE. Randomly removes a proportion of frames from the sequence,
+    simulating speed variation across signers and repetitions. The proportion is drawn
+    uniformly from [dropout_min, dropout_max]. Remaining frames are kept in their
+    original order, preserving temporal structure.
+
+    Ported from pose_format's PoseBody.frame_dropout_uniform.
+
+    :param sign: Dictionary with sequential skeletal data of the signing person
+    :param dropout_min: Minimum proportion of frames to drop (0.0 = keep all)
+    :param dropout_max: Maximum proportion of frames to drop (e.g. 0.3 = up to 30%)
+    :return: Dictionary with a random subset of frames removed
+    """
+    any_key = next(iter(sign))
+    num_frames = len(sign[any_key])
+
+    dropout_percent = random.uniform(dropout_min, dropout_max)
+    num_to_drop = min(int(num_frames * dropout_percent), num_frames - 1)
+
+    if num_to_drop <= 0:
+        return sign
+
+    drop_indexes = set(random.sample(range(num_frames), num_to_drop))
+    keep_indexes = [i for i in range(num_frames) if i not in drop_indexes]
+
+    return {key: [frames[i] for i in keep_indexes] for key, frames in sign.items()}
+
+
 def __random_pass(prob):
     return random.random() < prob
 

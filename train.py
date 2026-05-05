@@ -16,6 +16,7 @@ from pathlib import Path
 
 from utils import __balance_val_split, __split_of_train_sequence, __log_class_statistics
 from datasets.czech_slr_dataset import CzechSLRDataset
+from datasets.pose_dataset import PoseFormatDataset
 from spoter.spoter_model import SPOTER
 from spoter.utils import train_epoch, evaluate
 from spoter.gaussian_noise import GaussianNoise
@@ -35,6 +36,29 @@ def get_default_args():
     # Data
     parser.add_argument("--training_set_path", type=str, default="", help="Path to the training dataset CSV file")
     parser.add_argument("--testing_set_path", type=str, default="", help="Path to the testing dataset CSV file")
+    parser.add_argument("--use_pose_format", action="store_true",
+                        help="Load data from .pose files via PoseFormatDataset instead of the legacy CSV format. "
+                             "The CSV must have 'pose_path' and 'label' columns.")
+    parser.add_argument("--pose_json", type=str, default="",
+                        help="Path to an itm_data.json metadata file. When set, --pose_dir must also be provided "
+                             "and data is loaded via PoseFormatDataset.from_json instead of a CSV.")
+    parser.add_argument("--pose_dir", type=str, default="",
+                        help="Directory containing .pose files named <video_id>.pose, used together with --pose_json.")
+    # Transfer learning
+    parser.add_argument("--pretrained_model", type=str, default="",
+                        help="Path to a pretrained SPOTER checkpoint (.pth). When set, all encoder weights are "
+                             "transferred and only the classification head is re-initialised for --num_classes.")
+    parser.add_argument("--freeze_encoder", action="store_true",
+                        help="Freeze the transformer encoder (and positional parameters) at the start of training. "
+                             "Use together with --freeze_epochs for a two-phase schedule.")
+    parser.add_argument("--freeze_epochs", type=int, default=0,
+                        help="Number of epochs to keep the encoder frozen before unfreezing for end-to-end "
+                             "fine-tuning. Only effective when --freeze_encoder is set. "
+                             "0 = start fully unfrozen (end-to-end from epoch 1).")
+    parser.add_argument("--finetune_lr_factor", type=float, default=0.1,
+                        help="LR multiplier applied when the encoder is unfrozen after --freeze_epochs. "
+                             "Keeps the pretrained encoder stable during end-to-end fine-tuning.")
+
     parser.add_argument("--experimental_train_split", type=float, default=None,
                         help="Determines how big a portion of the training set should be employed (intended for the "
                              "gradually enlarging training set experiment from the paper)")
@@ -57,13 +81,20 @@ def get_default_args():
                         help="Determines whether to save weights checkpoints")
 
     # Scheduler
-    parser.add_argument("--scheduler_factor", type=int, default=0.1, help="Factor for the ReduceLROnPlateau scheduler")
+    parser.add_argument("--no_scheduler", action="store_true",
+                        help="Disable the ReduceLROnPlateau scheduler and train at a fixed LR (matches the original SPOTER paper)")
+    parser.add_argument("--scheduler_factor", type=float, default=0.1, help="Factor for the ReduceLROnPlateau scheduler")
     parser.add_argument("--scheduler_patience", type=int, default=5,
                         help="Patience for the ReduceLROnPlateau scheduler")
 
+    # Loss
+    parser.add_argument("--label_smoothing", type=float, default=0.0,
+                        help="Label smoothing factor for CrossEntropyLoss (0 = off). "
+                             "Values around 0.1 help when training on noisy or pseudo-labels.")
+
     # Gaussian noise normalization
-    parser.add_argument("--gaussian_mean", type=int, default=0, help="Mean parameter for Gaussian noise layer")
-    parser.add_argument("--gaussian_std", type=int, default=0.001,
+    parser.add_argument("--gaussian_mean", type=float, default=0, help="Mean parameter for Gaussian noise layer")
+    parser.add_argument("--gaussian_std", type=float, default=0.001,
                         help="Standard deviation parameter for Gaussian noise layer")
 
     # Visualization
@@ -95,7 +126,7 @@ def train(args):
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
         handlers=[
-            logging.FileHandler(args.experiment_name + "_" + str(args.experimental_train_split).replace(".", "") + ".log")
+            logging.FileHandler(args.experiment_name + ("_" + str(args.experimental_train_split).replace(".", "") if args.experimental_train_split else "") + ".log")
         ]
     )
 
@@ -104,16 +135,6 @@ def train(args):
     if torch.cuda.is_available():
         device = torch.device("cuda")
 
-    # Construct the model
-    slrt_model = SPOTER(num_classes=args.num_classes, hidden_dim=args.hidden_dim)
-    slrt_model.train(True)
-    slrt_model.to(device)
-
-    # Construct the other modules
-    cel_criterion = nn.CrossEntropyLoss()
-    sgd_optimizer = optim.SGD(slrt_model.parameters(), lr=args.lr)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(sgd_optimizer, factor=args.scheduler_factor, patience=args.scheduler_patience)
-
     # Ensure that the path for checkpointing and for images both exist
     Path("out-checkpoints/" + args.experiment_name + "/").mkdir(parents=True, exist_ok=True)
     Path("out-img/").mkdir(parents=True, exist_ok=True)
@@ -121,39 +142,109 @@ def train(args):
 
     # MARK: DATA
 
-    # Training set
     transform = transforms.Compose([GaussianNoise(args.gaussian_mean, args.gaussian_std)])
-    train_set = CzechSLRDataset(args.training_set_path, transform=transform, augmentations=True)
 
-    # Validation set
-    if args.validation_set == "from-file":
-        val_set = CzechSLRDataset(args.validation_set_path)
-        val_loader = DataLoader(val_set, shuffle=True, generator=g)
+    if args.pose_json:
+        # ── JSON metadata mode (itm_data.json) ───────────────────────────────
+        # Splits are encoded inside the JSON; a single file covers train/val/test.
+        train_set = PoseFormatDataset.from_json(
+            args.pose_json, args.pose_dir, split="train",
+            transform=transform, augmentations=True,
+        )
 
-    elif args.validation_set == "split-from-train":
-        train_set, val_set = __balance_val_split(train_set, 0.2)
+        # Derive num_classes before any split replaces train_set with a Subset.
+        args.num_classes = train_set.num_classes
 
-        val_set.transform = None
-        val_set.augmentations = False
-        val_loader = DataLoader(val_set, shuffle=True, generator=g)
+        # Validation set
+        if args.validation_set == "from-file":
+            val_set = PoseFormatDataset.from_json(args.pose_json, args.pose_dir, split="val")
+            val_loader = DataLoader(val_set, shuffle=True, generator=g, num_workers=4, persistent_workers=True)
+        elif args.validation_set == "split-from-train":
+            train_set, val_set = __balance_val_split(train_set, 0.2)
+            val_set.dataset.transform = None
+            val_set.dataset.augmentations = False
+            val_loader = DataLoader(val_set, shuffle=True, generator=g, num_workers=4, persistent_workers=True)
+        else:
+            val_loader = None
 
-    else:
-        val_loader = None
+        # Testing set
+        eval_set    = PoseFormatDataset.from_json(args.pose_json, args.pose_dir, split="test")
+        eval_loader = DataLoader(eval_set, shuffle=True, generator=g, num_workers=4, persistent_workers=True) \
+            if len(eval_set) > 0 else None
 
-    # Testing set
-    if args.testing_set_path:
-        eval_set = CzechSLRDataset(args.testing_set_path)
-        eval_loader = DataLoader(eval_set, shuffle=True, generator=g)
+    elif args.use_pose_format:
+        # ── CSV mode with .pose files ─────────────────────────────────────────
+        train_set = PoseFormatDataset.from_csv(
+            args.training_set_path, transform=transform, augmentations=True,
+        )
 
-    else:
+        if args.validation_set == "from-file":
+            val_set = PoseFormatDataset.from_csv(args.validation_set_path)
+            val_loader = DataLoader(val_set, shuffle=True, generator=g, num_workers=4, persistent_workers=True)
+        elif args.validation_set == "split-from-train":
+            train_set, val_set = __balance_val_split(train_set, 0.2)
+            val_set.dataset.transform = None
+            val_set.dataset.augmentations = False
+            val_loader = DataLoader(val_set, shuffle=True, generator=g, num_workers=4, persistent_workers=True)
+        else:
+            val_loader = None
+
         eval_loader = None
+        if args.testing_set_path:
+            eval_set    = PoseFormatDataset.from_csv(args.testing_set_path)
+            eval_loader = DataLoader(eval_set, shuffle=True, generator=g, num_workers=4, persistent_workers=True)
+
+    else:
+        # ── Legacy CSV mode (original SPOTER) ─────────────────────────────────
+        train_set = CzechSLRDataset(args.training_set_path, transform=transform, augmentations=True)
+
+        if args.validation_set == "from-file":
+            val_set = CzechSLRDataset(args.validation_set_path)
+            val_loader = DataLoader(val_set, shuffle=True, generator=g, num_workers=4, persistent_workers=True)
+        elif args.validation_set == "split-from-train":
+            train_set, val_set = __balance_val_split(train_set, 0.2)
+            val_set.dataset.transform = None
+            val_set.dataset.augmentations = False
+            val_loader = DataLoader(val_set, shuffle=True, generator=g, num_workers=4, persistent_workers=True)
+        else:
+            val_loader = None
+
+        eval_loader = None
+        if args.testing_set_path:
+            eval_set    = CzechSLRDataset(args.testing_set_path)
+            eval_loader = DataLoader(eval_set, shuffle=True, generator=g, num_workers=4, persistent_workers=True)
 
     # Final training set refinements
     if args.experimental_train_split:
         train_set = __split_of_train_sequence(train_set, args.experimental_train_split)
 
-    train_loader = DataLoader(train_set, shuffle=True, generator=g)
+    train_loader = DataLoader(train_set, shuffle=True, generator=g, num_workers=4, persistent_workers=True)
 
+    # MARK: MODEL
+    # Constructed here so that args.num_classes is already updated from the
+    # dataset (JSON mode sets it automatically from the gloss vocabulary).
+
+    if args.pretrained_model:
+        # Only freeze on load when freeze_epochs > 0; freeze_epochs=0 means
+        # train fully end-to-end from the start (freeze for 0 epochs).
+        slrt_model = SPOTER.from_pretrained(
+            args.pretrained_model,
+            num_classes=args.num_classes,
+            freeze_encoder=args.freeze_encoder and args.freeze_epochs > 0,
+        )
+    else:
+        slrt_model = SPOTER(num_classes=args.num_classes, hidden_dim=args.hidden_dim)
+
+    slrt_model.train(True)
+    slrt_model.to(device)
+
+    cel_criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+    sgd_optimizer = optim.SGD(
+        filter(lambda p: p.requires_grad, slrt_model.parameters()), lr=args.lr
+    )
+    scheduler = None if args.no_scheduler else optim.lr_scheduler.ReduceLROnPlateau(
+        sgd_optimizer, factor=args.scheduler_factor, patience=args.scheduler_patience
+    )
 
     # MARK: TRAINING
     train_acc, val_acc = 0, 0
@@ -171,6 +262,19 @@ def train(args):
         logging.info("Starting " + args.experiment_name + "...\n\n")
 
     for epoch in range(args.epochs):
+
+        # ── Two-phase fine-tuning: unfreeze encoder after freeze_epochs ───────
+        if (args.pretrained_model and args.freeze_encoder
+                and args.freeze_epochs > 0 and epoch == args.freeze_epochs):
+            slrt_model.unfreeze_encoder()
+            finetune_lr = args.lr * args.finetune_lr_factor
+            sgd_optimizer = optim.SGD(slrt_model.parameters(), lr=finetune_lr)
+            scheduler = None if args.no_scheduler else optim.lr_scheduler.ReduceLROnPlateau(
+                sgd_optimizer, factor=args.scheduler_factor, patience=args.scheduler_patience
+            )
+            print(f"Epoch {epoch + 1}: encoder unfrozen, LR reset to {finetune_lr:.2e}")
+            logging.info("Epoch %d: encoder unfrozen, LR reset to %.2e", epoch + 1, finetune_lr)
+
         train_loss, _, _, train_acc = train_epoch(slrt_model, train_loader, cel_criterion, sgd_optimizer, device)
         losses.append(train_loss.item() / len(train_loader))
         train_accs.append(train_acc)
@@ -219,8 +323,11 @@ def train(args):
     if eval_loader:
         for i in range(checkpoint_index):
             for checkpoint_id in ["t", "v"]:
+                checkpoint_path = "out-checkpoints/" + args.experiment_name + "/checkpoint_" + checkpoint_id + "_" + str(i) + ".pth"
+                if not os.path.exists(checkpoint_path):
+                    continue
                 # tested_model = VisionTransformer(dim=2, mlp_dim=108, num_classes=100, depth=12, heads=8)
-                tested_model = torch.load("out-checkpoints/" + args.experiment_name + "/checkpoint_" + checkpoint_id + "_" + str(i) + ".pth")
+                tested_model = torch.load(checkpoint_path, weights_only=False)
                 tested_model.train(False)
                 _, _, eval_acc = evaluate(tested_model, eval_loader, device, print_stats=True)
 
