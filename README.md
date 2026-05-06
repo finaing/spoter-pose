@@ -158,7 +158,7 @@ This adaptation is published under the same [Apache License 2.0](LICENSE) as the
 
 The **code** may be used for both academic and commercial purposes provided that the License and copyright notice are included, the original work is cited, and all changes are stated.
 
-Copyright 2021–2022 Matyáš Boháček (original SPOTER)
+© 2022 Matyáš Boháček and Marek Hrúz (original SPOTER)
 
 ---
 
