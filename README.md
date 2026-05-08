@@ -27,7 +27,36 @@ All three produce identical tensor format after loading; the estimator differenc
 
 ### 2. JSON metadata loading
 
-In addition to CSV-based loading, `PoseFormatDataset.from_json()` loads directly from an `itm_data.json` metadata file. Labels are derived from the `word_label` field across the full JSON so the label space is consistent across train, val, and test splits.
+`PoseFormatDataset.from_json()` loads directly from a JSON metadata file instead of a CSV. The JSON is a flat list of gloss entries; each entry groups all video instances of one sign together with a string label (`word_label`) and a split assignment per instance. Integer class IDs are derived on the fly from the full list of `word_label` values — preserving insertion order and deduplicating — so the label space is identical whether you load `"train"`, `"val"`, or `"test"`.
+
+The `.pose` file for each instance is looked up as `<pose_dir>/<video_id>.pose`.
+
+**Example of JSON structure:**
+
+```json
+[
+  {
+    "word_label": "hello",
+    "instances": [
+      { "video_id": "hello_001", "split": "train" },
+      { "video_id": "hello_002", "split": "train" },
+      { "video_id": "hello_003", "split": "val"   },
+      { "video_id": "hello_004", "split": "test"  }
+    ]
+  },
+  {
+    "word_label": "goodbye",
+    "instances": [
+      { "video_id": "goodbye_001", "split": "train" },
+      { "video_id": "goodbye_002", "split": "test"  }
+    ]
+  }
+]
+```
+
+Only `word_label`, `instances[*].video_id`, and `instances[*].split` are read; any additional fields in the file are ignored.
+
+This setup was used for an Icelandic Sign Language (ÍTM) dataset that had word labels instead of glosses, but the code can easily be adapted to match a different key (such as `gloss`).
 
 ### 3. Transfer learning (`train.py`)
 
@@ -134,6 +163,52 @@ python test.py \
   --dir_ap           /path/to/alphapose_poses/ \
   --dir_sdp          /path/to/sdpose_poses/
 ```
+
+---
+
+## Example SLURM Scripts
+
+The four `example_*.sh` scripts in are self-contained SLURM job files that were used in experiments with the ÍTM dataset. Each sets its own hyperparameters and paths at the top; to reuse one, copy it, update the path variables, and submit with `sbatch`.
+
+### `example_train_itm_full.sh` — train from scratch on ÍTM
+
+Trains a fresh SPOTER model on the full ÍTM dataset (MediaPipe poses, 30 fps) for 350 epochs at lr 0.001 with a patience-5 ReduceLROnPlateau scheduler.
+
+```shell
+sbatch example_train_itm_full.sh
+```
+
+Key settings: `POSE_JSON=itm_data.json`, `POSE_DIR=mediapipe_30_pose`, `EPOCHS=350`, `HIDDEN_DIM=108`.
+
+### `example_pretrain_asl_citizen.sh` — pretrain on ASL Citizen
+
+Trains on the ASL Citizen dataset for 30 epochs to produce a cross-lingual source checkpoint. `PRETRAINED_MODEL` is empty by default (train from scratch); set it to a `.pth` path to fine-tune instead. The two-phase schedule variables (`FREEZE_EPOCHS`, `FINETUNE_LR_FACTOR`) are wired up but dormant until `PRETRAINED_MODEL` is set.
+
+```shell
+sbatch example_pretrain_asl_citizen.sh
+```
+
+Key settings: `POSE_JSON=asl_citizen_data.json`, `POSE_DIR=ASL_Citizen/poses`, `EPOCHS=30`.
+
+### `example_finetune_itm_asl_30_frozen.sh` — fine-tune ÍTM from ASL Citizen checkpoint
+
+Loads the ASL Citizen checkpoint produced by the previous script and fine-tunes on ÍTM using a two-phase schedule: encoder frozen for the first 30 epochs (only the classification head trains), then unfrozen for the remaining 120 epochs at `lr × 0.1`.
+
+```shell
+sbatch example_finetune_itm_asl_30_frozen.sh
+```
+
+Key settings: `PRETRAINED_MODEL=out-checkpoints/asl_citizen_pretrain_30/checkpoint_t_2.pth`, `FREEZE_EPOCHS=30`, `FINETUNE_LR_FACTOR=0.1`, `EPOCHS=150`.
+
+### `example_test.sh` — evaluate all checkpoints in a directory
+
+Runs `test.py` (Mode A) over every `.pth` file in `CHECKPOINTS_DIR` and reports top-1 accuracy for each. Edit `CHECKPOINTS_DIR`, `POSE_JSON`, and `POSE_DIR` to point at a different experiment.
+
+```shell
+sbatch example_test.sh
+```
+
+Key settings: `CHECKPOINTS_DIR=out-checkpoints/ap_double`, `POSE_JSON=itm_data.json`.
 
 ---
 
